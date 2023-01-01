@@ -1,7 +1,10 @@
 ﻿#include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-#include <thrust/reduce.h>
 #include <thrust/execution_policy.h>
+#include <thrust/reduce.h>
+#include <thrust/sort.h>
+#include <thrust/iterator/constant_iterator.h>
+#include <thrust/iterator/discard_iterator.h>
 
 #include <stdio.h>
 #include <stdio.h>
@@ -19,11 +22,11 @@
 #define MAX_ITERATIONS 500
 #define DEBUG 1
 
-cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations);
+cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships);
 float* readFile(
 	char* filename,
-	int* numObjs,
-	int* numCoords);
+	int* pointsCount,
+	int* dimNum);
 int writeFile(char* filename,
 	int numClusters,
 	int numObjs,
@@ -32,9 +35,12 @@ int writeFile(char* filename,
 	int* membership);
 void coalesceData(float** points, int pointsCount, int dimNum);
 void unCoalesceData(float** points, int pointsCount, int dimNum);
+void getMinMax(float* points, int pointsCount, int dimNum, float** maxCoordinates, float** minCoordinates);
+void generateClusters(float* minCoordinates, float* maxCoordinates, float** clusters, int clusterCount, int dimNum);
 void printClusters(float* data, int numObjs, int numCoords);
+void generateRandomPoints(char* path, int pointsCount, int dimNum);
 
-__global__ void pointsDistance(float* points, float* clusters, int* membership, int* membershipChanged, int clustersCount, int pointsCount, int dimNum)
+__global__ void pointsDistance(float* points, float* clusters, int* membership, int* membershipDims, int* membershipChanged, int clustersCount, int pointsCount, int dimNum)
 {
 	int pointNum = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x;
 	float minDistance = FLT_MAX;
@@ -69,50 +75,46 @@ __global__ void pointsDistance(float* points, float* clusters, int* membership, 
 	else {
 		membershipChanged[pointNum] = 0;
 	}
+
+	__syncthreads();
+	for (size_t i = 0; i < dimNum; i++)
+	{
+		membershipDims[i * pointsCount + pointNum] = i * clustersCount + currentMembership;
+	}
 	__syncthreads();
 	membership[pointNum] = currentMembership;
 }
 
-__global__ void newClustersMean(float* points, int* membership, float* newClusters, int clustersCount, int pointsCount, int dimNum)
-{
-	int clusterId = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x;
-	int members = 0;
+__global__ void updateClusters(float* clusters, float* clusterSums, int* clusterMembersCount, int* clusterMembersCountKeys, int clusterCount, int dimNum, int usedClusters) {
 
-	extern __shared__ float newClustersSums[];
+	int threadId = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x;
 
-	if (clusterId >= clustersCount)
+	if (threadId >= usedClusters)
 		return;
 
-	for (size_t j = 0; j < dimNum; j++)
-	{
-		newClustersSums[j * clustersCount + clusterId] = 0;
-	}
+	int clusterId = clusterMembersCountKeys[threadId];
+	int members = clusterMembersCount[threadId];
 
-	for (size_t i = 0; i < pointsCount; i++)
+	for (size_t i = 0; i < dimNum; i++)
 	{
-		if (membership[i] == clusterId)
-			for (size_t j = 0; j < dimNum; j++)
-			{
-				newClustersSums[j * clustersCount + clusterId] += points[j * pointsCount + i];
-				members++;
-			}
+		clusters[i * clusterCount + clusterId] = clusterSums[i * usedClusters + threadId] / members;
 	}
-
-	__syncthreads();
-	if (members != 0)
-		for (size_t j = 0; j < dimNum; j++)
-		{
-			newClusters[j * clustersCount + clusterId] = newClustersSums[j * clustersCount + clusterId] / members;
-		}
 }
 
 int main()
 {
 	// TODO: Wczytywanie z parametrów threshold, liczby centroidów (K), wyznaczanie początkowych punktów (losowo z zakresu wczytanych danych??)
-	const char* fileName = "C:\\Users\\spawl\\Desktop\\MiNI_5\\GPU\\kmeans_demo\\kmeans\\Image_data\\color100.txt";
-	int clustersCount = 10;
+	const char* fileName = "C:\\Users\\spawl\\Desktop\\MiNI_5\\GPU\\kmeans_demo\\kmeans\\Image_data\\out2.txt";
+	const char* outputName = "C:\\Users\\spawl\\Desktop\\MiNI_5\\GPU\\kmeans_demo\\kmeans\\Image_data\\out2.txt";
+
+	int clustersCount = 100;
 	int pointsCount = 0, dimNum;
-	float threshold = 0.000001;
+	float threshold = 0.0001;
+	float* minCoordinates = NULL;
+	float* maxCoordinates = NULL;
+	float* clusters = NULL;
+	int* memberships = NULL;
+
 
 	printf("Reading file...\n");
 	auto cpuStart = std::chrono::high_resolution_clock::now();
@@ -122,26 +124,36 @@ int main()
 	printf("Elapsed %fs...\n", diff.count());
 
 	coalesceData(&points, pointsCount, dimNum);
-	float* clusters;
+	getMinMax(points, pointsCount, dimNum, &maxCoordinates, &minCoordinates);
+	generateClusters(minCoordinates, maxCoordinates, &clusters, clustersCount, dimNum);
+	printClusters(clusters, clustersCount, dimNum);
 	int iterations;
-	auto cudaStatus = kMeansCuda(points, clustersCount, pointsCount, dimNum, threshold, &clusters, &iterations);
+	auto cudaStatus = kMeansCuda(points, clustersCount, pointsCount, dimNum, threshold, &clusters, &iterations, &memberships);
 	if (cudaStatus == cudaSuccess) {
 		printf("Iterations: %d\n", iterations);
 		unCoalesceData(&clusters, clustersCount, dimNum);
-		printClusters(clusters, clustersCount, dimNum);
+		writeFile((char*)outputName, clustersCount, pointsCount, dimNum, clusters, memberships);
 	}
 
-
+	delete minCoordinates;
+	delete maxCoordinates;
+	delete clusters;
+	delete memberships;
 	return EXIT_SUCCESS;
 }
 
-cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations)
+cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships)
 {
 	float* dev_points = NULL;
+	float* dev_points_sums = NULL;
 	float* dev_clusters = NULL;
-	float* dev_newClusters = NULL;
+	float* dev_clustersSums = NULL;
+	int* dev_membershipDims = NULL;
 	int* dev_membership = NULL;
+	int* dev_currentMembership = NULL;
 	int* dev_membershipChanged = NULL;
+	int* dev_clusterSizes = NULL;
+	int* dev_clusterSizesKeys = NULL;
 	float* dev_delta = NULL;
 	float delta = FLT_MAX;
 	cudaError_t cudaStatus;
@@ -153,6 +165,8 @@ cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int di
 	while (nearestPowerOfTwo < clustersCount)
 		nearestPowerOfTwo *= 2;
 	int iterationNumber = 0;
+
+	printf("Preparing memory...\n");
 
 	cudaStatus = cudaSetDevice(0);
 	if (cudaStatus != cudaSuccess) {
@@ -166,19 +180,37 @@ cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int di
 		goto Error;
 	}
 
+	cudaStatus = cudaMalloc((void**)&dev_points_sums, pointsCount * dimNum * sizeof(float));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
 	cudaStatus = cudaMalloc((void**)&dev_clusters, clustersCount * dimNum * sizeof(float));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
 	}
 
-	cudaStatus = cudaMalloc((void**)&dev_newClusters, clustersCount * dimNum * sizeof(float));
+	cudaStatus = cudaMalloc((void**)&dev_clustersSums, clustersCount * dimNum * sizeof(float));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&dev_membershipDims, dimNum * pointsCount * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
 	}
 
 	cudaStatus = cudaMalloc((void**)&dev_membership, pointsCount * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&dev_currentMembership, pointsCount * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
@@ -196,14 +228,35 @@ cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int di
 		goto Error;
 	}
 
+	cudaStatus = cudaMalloc((void**)&dev_clusterSizes, clustersCount * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
+	cudaStatus = cudaMalloc((void**)&dev_clusterSizesKeys, clustersCount * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed!");
+		goto Error;
+	}
+
 	cudaStatus = cudaMemcpy(dev_points, points, pointsCount * dimNum * sizeof(float), cudaMemcpyHostToDevice);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
 		goto Error;
 	}
 
-	cudaMemset(dev_membership, -1, pointsCount * sizeof(int));
+	cudaStatus = cudaMemcpy(dev_clusters, *clusters, clustersCount * dimNum * sizeof(float), cudaMemcpyHostToDevice);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
 
+	cudaStatus = cudaMemset(dev_membership, -1, pointsCount * sizeof(int));
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemset failed!");
+		goto Error;
+	}
 
 	cudaEvent_t start, stop;
 	cudaEventCreate(&start);
@@ -211,14 +264,17 @@ cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int di
 	printf("Calculating on GPU...\n");
 	cudaEventRecord(start, 0);
 	do {
-		float* temp = dev_clusters;
-		dev_clusters = dev_newClusters;
-		dev_newClusters = temp;
+		pointsDistance << <blocksCount, THREADS_PER_BLOCK >> > (dev_points, dev_clusters, dev_membership, dev_membershipDims, dev_membershipChanged, clustersCount, pointsCount, dimNum);
 
-		pointsDistance << <blocksCount, THREADS_PER_BLOCK >> > (dev_points, dev_clusters, dev_membership, dev_membershipChanged, clustersCount, pointsCount, dimNum);
 		cudaStatus = cudaGetLastError();
 		if (cudaStatus != cudaSuccess) {
 			fprintf(stderr, "pointsDistance launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			goto Error;
+		}
+
+		cudaStatus = cudaMemcpy(dev_points_sums, dev_points, pointsCount * dimNum * sizeof(int), cudaMemcpyDeviceToDevice);
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaMemcpy failed!");
 			goto Error;
 		}
 
@@ -227,24 +283,37 @@ cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int di
 			fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching pointsDistance!\n", cudaStatus);
 			goto Error;
 		}
-		// obliczenie nowych współrzędnych centroidów - środek ciężkości tych, które należą 
-		newClustersMean << <newClustersBlocksCount, THREADS_PER_BLOCK, clustersCount* dimNum * sizeof(float) >> > (dev_points, dev_membership, dev_newClusters, clustersCount, pointsCount, dimNum);
-		cudaStatus = cudaGetLastError();
+
+		cudaStatus = cudaMemcpy(dev_currentMembership, dev_membership, pointsCount * sizeof(int), cudaMemcpyDeviceToDevice);
 		if (cudaStatus != cudaSuccess) {
-			fprintf(stderr, "newClustersMean launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			fprintf(stderr, "cudaMemcpy failed!");
 			goto Error;
 		}
 
-		cudaStatus = cudaDeviceSynchronize();
+		thrust::sort(thrust::device, dev_currentMembership, dev_currentMembership + pointsCount);
+		auto pair = thrust::reduce_by_key(thrust::device, dev_currentMembership, dev_currentMembership + pointsCount, thrust::make_constant_iterator(1), dev_clusterSizesKeys, dev_clusterSizes);
+		int usedClusters = pair.first - dev_clusterSizesKeys;
+		thrust::sort_by_key(thrust::device, dev_membershipDims, dev_membershipDims + pointsCount * dimNum, dev_points_sums);
+		thrust::reduce_by_key(thrust::device, dev_membershipDims, dev_membershipDims + pointsCount * dimNum, dev_points_sums, thrust::make_discard_iterator(), dev_clustersSums);
+
+		updateClusters << <newClustersBlocksCount, THREADS_PER_BLOCK >> > (dev_clusters, dev_clustersSums, dev_clusterSizes, dev_clusterSizesKeys, clustersCount, dimNum, usedClusters);
+		cudaStatus = cudaGetLastError();
 		if (cudaStatus != cudaSuccess) {
-			fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching newClustersMean!\n", cudaStatus);
+			fprintf(stderr, "pointsDistance launch failed: %s\n", cudaGetErrorString(cudaStatus));
 			goto Error;
 		}
-		// obliczenie delty między poprzednim rozwiązaniem a obecnym - średnia róznica odległości między poprzednimi centroidami a nowymi 
+
 		delta = (float)thrust::reduce(thrust::device, dev_membershipChanged, dev_membershipChanged + pointsCount);
 		delta /= pointsCount;
 
-	} while (delta > threshold && ++iterationNumber < MAX_ITERATIONS);
+		cudaStatus = cudaDeviceSynchronize();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching pointsDistance!\n", cudaStatus);
+			goto Error;
+		}
+
+		iterationNumber++;
+	} while (delta > threshold && iterationNumber < MAX_ITERATIONS);
 	float time;
 	cudaEventRecord(stop, 0);
 	cudaEventSynchronize(stop);
@@ -252,9 +321,16 @@ cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int di
 	printf("Elapsed %fs\n", time / 1000);
 
 	*iterations = iterationNumber;
-	*clusters = new float[clustersCount * dimNum];
 
-	cudaStatus = cudaMemcpy(*clusters, dev_newClusters, clustersCount * dimNum * sizeof(float), cudaMemcpyDeviceToHost);
+	cudaStatus = cudaMemcpy(*clusters, dev_clusters, clustersCount * dimNum * sizeof(float), cudaMemcpyDeviceToHost);
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaMemcpy failed!");
+		goto Error;
+	}
+
+	*memberships = new int[pointsCount];
+
+	cudaStatus = cudaMemcpy(*memberships, dev_membership, pointsCount * sizeof(int), cudaMemcpyDeviceToHost);
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMemcpy failed!");
 		goto Error;
@@ -262,9 +338,15 @@ cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int di
 
 Error:
 	cudaFree(dev_points);
+	cudaFree(dev_points_sums);
 	cudaFree(dev_clusters);
-	cudaFree(dev_newClusters);
+	cudaFree(dev_clustersSums);
+	cudaFree(dev_membershipDims);
 	cudaFree(dev_membership);
+	cudaFree(dev_currentMembership);
+	cudaFree(dev_membershipChanged);
+	cudaFree(dev_clusterSizes);
+	cudaFree(dev_clusterSizesKeys);
 	cudaFree(dev_delta);
 
 	return cudaStatus;
@@ -290,13 +372,12 @@ void coalesceData(float** points, int pointsCount, int dimNum) {
 void unCoalesceData(float** points, int pointsCount, int dimNum) {
 
 	float* unCoalesced = new float[pointsCount * dimNum];
-	int64_t indx = 0;
 
 	for (size_t i = 0; i < pointsCount; i++)
 	{
 		for (size_t j = 0; j < dimNum; j++)
 		{
-			unCoalesced[i * dimNum + j] = (*points)[j*pointsCount + i];
+			unCoalesced[i * dimNum + j] = (*points)[j * pointsCount + i];
 		}
 	}
 
@@ -304,10 +385,51 @@ void unCoalesceData(float** points, int pointsCount, int dimNum) {
 	*points = unCoalesced;
 }
 
+void generateClusters(float* minCoordinates, float* maxCoordinates, float** clusters, int clusterCount, int dimNum) {
+
+	*clusters = new float[clusterCount * dimNum];
+
+
+	for (size_t i = 0; i < dimNum; i++)
+	{
+		float diff = maxCoordinates[i] - minCoordinates[i];
+
+		for (size_t j = 0; j < clusterCount; j++)
+		{
+			float random = (float)rand() / (float)RAND_MAX;
+			(*clusters)[i * clusterCount + j] = random * diff + minCoordinates[i];
+		}
+	}
+
+}
+
+void getMinMax(float* points, int pointsCount, int dimNum, float** maxCoordinates, float** minCoordinates) {
+
+	(*minCoordinates) = (float*)malloc(dimNum * sizeof(float));
+	(*maxCoordinates) = (float*)malloc(dimNum * sizeof(float));
+	memset(*minCoordinates, FLT_MAX, dimNum * sizeof(float));
+	memset(*maxCoordinates, FLT_MIN, dimNum * sizeof(float));
+
+
+	for (size_t i = 0; i < dimNum; i++)
+	{
+		for (size_t j = 0; j < pointsCount; j++)
+		{
+			auto coordinate = points[i * pointsCount + j];
+
+			if ((*maxCoordinates)[i] < coordinate)
+				(*maxCoordinates)[i] = coordinate;
+			if ((*minCoordinates)[i] > coordinate)
+				(*minCoordinates)[i] = coordinate;
+		}
+	}
+}
+
 float* readFile(
 	char* filename,
-	int* pointsCount,       /* no. data objects (local) */
-	int* dimNum)     /* no. coordinates */
+	int* pointsCount,      
+	int* dimNum
+) 
 {
 	float* points;
 	int     i, j, len;
@@ -366,12 +488,16 @@ float* readFile(
 	len = (*pointsCount) * (*dimNum);
 	points = (float*)malloc((*pointsCount) * (*dimNum) * sizeof(float*));
 
+	
 	i = 0;
 	/* read all objects */
 	while (fgets(line, lineLen, infile) != NULL) {
 		if (strtok(line, " \t\n") == NULL) continue;
-		for (j = 0; j < (*dimNum); j++)
-			points[i * (*dimNum) + j] = (float)atof(strtok(NULL, " ,\t\n"));
+		for (j = 0; j < (*dimNum); j++) {
+			float coordinate = (float)atof(strtok(NULL, " ,\t\n"));
+
+			points[i * (*dimNum) + j] = coordinate;
+		}
 		i++;
 	}
 
@@ -397,12 +523,12 @@ void printClusters(float* points, int pointsCount, int dimNum) {
 	}
 }
 
-int writeFile(char* filename, 
-	int clustersCount, 
-	int pointsCount,     
-	int dimNum,   
-	float* clusters,    
-	int* membership)  
+int writeFile(char* filename,
+	int clustersCount,
+	int pointsCount,
+	int dimNum,
+	float* clusters,
+	int* membership)
 {
 	FILE* fptr;
 	int   i, j;
@@ -429,4 +555,31 @@ int writeFile(char* filename,
 	fclose(fptr);
 
 	return 1;
+}
+
+void generateRandomPoints(char* path, int pointsCount, int dimNum) {
+
+	FILE* outFile = NULL;
+
+	if ((outFile = fopen(path, "w")) == NULL) {
+		fprintf(stderr, "Error: Cannot create a new file (%s)\n", path);
+		return;
+	}
+
+	float min = -5;
+	float max = 5;
+	float diff = max - min;
+
+	for (size_t i = 0; i < pointsCount; i++)
+	{
+		fprintf(outFile, "%d ", i);
+
+		for (size_t j = 0; j < dimNum; j++)
+		{
+			float random = (float)rand() / (float)RAND_MAX;
+			fprintf(outFile, "%f ", random * diff + min);
+		}
+	
+		fprintf(outFile, "\n");
+	}
 }
