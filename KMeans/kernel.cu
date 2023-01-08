@@ -16,6 +16,7 @@
 #include <cassert>
 #include <limits>
 #include <chrono>
+#include <random>
 
 #define MAX_CHAR_PER_LINE 128
 #define THREADS_PER_BLOCK 1024
@@ -39,6 +40,7 @@ void getMinMax(float* points, int pointsCount, int dimNum, float** maxCoordinate
 void generateClusters(float* minCoordinates, float* maxCoordinates, float** clusters, int clusterCount, int dimNum);
 void printClusters(float* data, int numObjs, int numCoords);
 void generateRandomPoints(char* path, int pointsCount, int dimNum);
+void generateRandomPointsNormal(char* path, int pointsCount, int dimNum, int groups);
 
 __global__ void pointsDistance(float* points, float* clusters, int* membership, int* membershipDims, int* membershipChanged, int clustersCount, int pointsCount, int dimNum)
 {
@@ -62,8 +64,6 @@ __global__ void pointsDistance(float* points, float* clusters, int* membership, 
 
 		if (distance < minDistance) {
 			minDistance = distance;
-			// jakby wraz z przynależnością wpisywać wymiar, to ułatwiłoby to zastosowanie thrust::reduce_by_key
-			// np. od 0 do clustersCount to pierwszy wymiar, potem od clustersCount do 2 * clustersCount to drugi wymiar itd
 			currentMembership = i;
 		}
 	}
@@ -103,18 +103,18 @@ __global__ void updateClusters(float* clusters, float* clusterSums, int* cluster
 
 int main()
 {
-	// TODO: Wczytywanie z parametrów threshold, liczby centroidów (K), wyznaczanie początkowych punktów (losowo z zakresu wczytanych danych??)
-	const char* fileName = "C:\\Users\\spawl\\Desktop\\MiNI_5\\GPU\\kmeans_demo\\kmeans\\Image_data\\out2.txt";
-	const char* outputName = "C:\\Users\\spawl\\Desktop\\MiNI_5\\GPU\\kmeans_demo\\kmeans\\Image_data\\out2.txt";
+	// TODO: Wczytywanie z parametrów threshold, liczby centroidów (K)
+	// dwie wersje mogą się odpalać jedno po drugim
+	const char* fileName = "C:\\Users\\spawl\\Desktop\\MiNI_5\\GPU\\kmeans_demo\\kmeans\\Image_data\\1mln2dimNormal.txt";
+	const char* outputName = "C:\\Users\\spawl\\Desktop\\MiNI_5\\GPU\\kmeans_demo\\kmeans\\Image_data\\1mln2dimNormal.txt";
 
-	int clustersCount = 100;
+	int clustersCount = 1000;
 	int pointsCount = 0, dimNum;
 	float threshold = 0.0001;
 	float* minCoordinates = NULL;
 	float* maxCoordinates = NULL;
 	float* clusters = NULL;
 	int* memberships = NULL;
-
 
 	printf("Reading file...\n");
 	auto cpuStart = std::chrono::high_resolution_clock::now();
@@ -125,6 +125,7 @@ int main()
 
 	coalesceData(&points, pointsCount, dimNum);
 	getMinMax(points, pointsCount, dimNum, &maxCoordinates, &minCoordinates);
+	// TODO: ziarno dla generatora na inpucie
 	generateClusters(minCoordinates, maxCoordinates, &clusters, clustersCount, dimNum);
 	printClusters(clusters, clustersCount, dimNum);
 	int iterations;
@@ -264,7 +265,7 @@ cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int di
 	printf("Calculating on GPU...\n");
 	cudaEventRecord(start, 0);
 	do {
-		pointsDistance << <blocksCount, THREADS_PER_BLOCK >> > (dev_points, dev_clusters, dev_membership, dev_membershipDims, dev_membershipChanged, clustersCount, pointsCount, dimNum);
+		pointsDistance << <blocksCount, THREADS_PER_BLOCK>> > (dev_points, dev_clusters, dev_membership, dev_membershipDims, dev_membershipChanged, clustersCount, pointsCount, dimNum);
 
 		cudaStatus = cudaGetLastError();
 		if (cudaStatus != cudaSuccess) {
@@ -582,4 +583,52 @@ void generateRandomPoints(char* path, int pointsCount, int dimNum) {
 	
 		fprintf(outFile, "\n");
 	}
+}
+
+void generateRandomPointsNormal(char* path, int pointsCount, int dimNum, int groups) {
+
+	FILE* outFile = NULL;
+
+	if ((outFile = fopen(path, "w")) == NULL) {
+		fprintf(stderr, "Error: Cannot create a new file (%s)\n", path);
+		return;
+	}
+
+	float min = -5;
+	float max = 5;
+	float diff = max - min;
+
+	std::random_device rd{};
+	std::mt19937 gen{ rd() };
+
+	for (size_t i = 0; i < pointsCount; i++)
+	{
+		fprintf(outFile, "%d ", i);
+
+		for (size_t j = 0; j < dimNum; j++)
+		{
+			float random = (float)rand() / (float)RAND_MAX;
+			fprintf(outFile, "%f ", random * diff + min);
+		}
+
+		fprintf(outFile, "\n");
+	}
+
+	for (size_t g = 0; g < groups; g++)
+	{
+		std::normal_distribution<> d{  -(float)groups / 2 + g, 0.2 };
+
+		for (size_t i = 0; i < pointsCount / groups; i++)
+		{
+			fprintf(outFile, "%d ", i);
+
+			for (size_t j = 0; j < dimNum; j++)
+			{
+				fprintf(outFile, "%f ", d(gen));
+			}
+
+			fprintf(outFile, "\n");
+		}
+	}
+
 }
