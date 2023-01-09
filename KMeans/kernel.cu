@@ -23,8 +23,8 @@
 #define MAX_ITERATIONS 500
 #define DEBUG 1
 
-cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships);
-cudaError_t kMeansFastReduce(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships);
+cudaError_t kMeansThrust(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships);
+cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships);
 float* readFile(
 	char* filename,
 	int* pointsCount,
@@ -42,6 +42,8 @@ void generateClusters(float* minCoordinates, float* maxCoordinates, float** clus
 void printClusters(float* data, int numObjs, int numCoords);
 void generateRandomPoints(char* path, int pointsCount, int dimNum);
 void generateRandomPointsNormal(char* path, int pointsCount, int dimNum, int groups);
+template <class T>
+cudaError_t reduce(T* data, int n);
 
 __global__ void pointsDistance(float* points, float* clusters, int* membership, int* membershipDims, int* membershipChanged, int clustersCount, int pointsCount, int dimNum)
 {
@@ -126,11 +128,12 @@ __device__ void reduce(volatile T* sdata, T* g_idata, T* g_odata, unsigned int n
 
 template <unsigned int blockSize, class T>
 __global__ void reduceGlobal(T* g_idata, T* g_odata, unsigned int n) {
-	extern __shared__ T rdata[];
-	reduce<THREADS_PER_BLOCK / 2>(rdata, g_idata, g_odata, n);
+	extern __shared__ unsigned char memory[];
+	T* sharedData = reinterpret_cast<T*>(memory);
+	reduce<blockSize>(sharedData, g_idata, g_odata, n);
 }
 
-__global__ void reduceCoordinates(float* points, float* clusters, int* membership, float* sums, float* newCluster, int membersCount, int pointsCount, int pointsCountPowerOfTwo, int clustersCount, int dimNum, int dimension, int cluster) {
+__global__ void pickCoordinate(float* points, float* clusters, int* membership, float* sums, float* newCluster, int membersCount, int pointsCount, int pointsCountPowerOfTwo, int clustersCount, int dimNum, int dimension, int cluster) {
 
 	extern __shared__ float pointData[];
 	int threadId = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x;
@@ -147,55 +150,12 @@ __global__ void reduceCoordinates(float* points, float* clusters, int* membershi
 	if (threadId < pointsCount) {
 		value = points[dimension * pointsCount + threadId];
 	}
-	value = member == cluster ? value : 0;
+	value = member == cluster ? value / membersCount : 0;
 
 	sums[threadId] = value;
-
-	__syncthreads();
-	reduce<THREADS_PER_BLOCK / 2>(pointData, sums, sums, pointsCountPowerOfTwo);
-
-	if (threadIdx.x == 0) {
-		newCluster[dimension * gridDim.x + blockIdx.x] = sums[blockIdx.x] / membersCount;
-	}
 }
 
-template <class T>
-__device__ void smallReduce(T* sums, T* result) {
-	auto step_size = 1;
-	int number_of_threads = blockDim.x / 2;
-
-	while (number_of_threads > 0)
-	{
-		if (threadIdx.x < number_of_threads)
-		{
-			const auto fst = threadIdx.x * step_size * 2;
-			const auto snd = fst + step_size;
-			sums[fst] += sums[snd];
-		}
-
-		step_size <<= 1;
-		number_of_threads >>= 1;
-	}
-
-	if (threadIdx.x == 0) {
-		result[0] = sums[0];
-	}
-}
-
-__global__ void updateCoordinates(float* clusters, float* newCluster, int clustersCount, int dimNum, int cluster) {
-
-	for (size_t i = 0; i < dimNum; i++)
-	{
-		smallReduce(newCluster + blockDim.x * i, newCluster + blockDim.x * i);
-
-		if (threadIdx.x == 0) {
-			//printf("%Dim %d : %f\n", i, newCluster[blockDim.x * i]);
-			clusters[i * clustersCount + cluster] = newCluster[blockDim.x * i];
-		}
-	}
-}
-
-__global__ void reduceMembers(int* membership, int* sums, int* result, int pointsCount, int pointsCountPowerOfTwo, int clustersCount, int cluster) {
+__global__ void pickMembership(int* membership, int* sums, int* result, int pointsCount, int pointsCountPowerOfTwo, int clustersCount, int cluster) {
 
 	extern __shared__ int data[];
 
@@ -207,19 +167,11 @@ __global__ void reduceMembers(int* membership, int* sums, int* result, int point
 	int member = threadId < pointsCount ? membership[threadId] : -1;
 	member = member == cluster ? 1 : 0;
 	sums[threadId] = member;
-
-	__syncthreads();
-	reduce<THREADS_PER_BLOCK / 2>(data, sums, sums, pointsCountPowerOfTwo);
-}
-
-template <class T>
-__global__ void updateMembers(T* sums, T* result) {
-	smallReduce(sums, result);
 }
 
 int main(int argc, char** argv)
 {
-	// dwie wersje mogą się odpalać jedno po drugim
+	// TODO: dwie wersje mogą się odpalać jedno po drugim
 	if (argc < 5)
 	{
 		printf("Wrong number of arguments!\n");
@@ -252,10 +204,10 @@ int main(int argc, char** argv)
 	int iterations;
 
 	if (strcmp(argv[4], "r") == 0) {
-		cudaStatus = kMeansFastReduce(points, clustersCount, pointsCount, dimNum, threshold, &clusters, &iterations, &memberships);
+		cudaStatus = kMeansReduce(points, clustersCount, pointsCount, dimNum, threshold, &clusters, &iterations, &memberships);
 	}
 	else {
-		cudaStatus = kMeansCuda(points, clustersCount, pointsCount, dimNum, threshold, &clusters, &iterations, &memberships);
+		cudaStatus = kMeansThrust(points, clustersCount, pointsCount, dimNum, threshold, &clusters, &iterations, &memberships);
 	}
 
 	if (cudaStatus == cudaSuccess) {
@@ -271,7 +223,7 @@ int main(int argc, char** argv)
 	return EXIT_SUCCESS;
 }
 
-cudaError_t kMeansCuda(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships)
+cudaError_t kMeansThrust(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships)
 {
 	float* dev_points = NULL;
 	float* dev_points_sums = NULL;
@@ -482,7 +434,7 @@ Error:
 	return cudaStatus;
 }
 
-cudaError_t kMeansFastReduce(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships) {
+cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int dimNum, float threshold, float** clusters, int* iterations, int** memberships) {
 
 	float* dev_points = NULL;
 	float* dev_sums = NULL;
@@ -497,14 +449,10 @@ cudaError_t kMeansFastReduce(float* points, int clustersCount, int pointsCount, 
 	cudaError_t cudaStatus;
 
 	int blocksCount = (int)ceil((float)pointsCount / THREADS_PER_BLOCK);
-
 	int pointsCountPowerOfTwo = 1;
-	while (pointsCountPowerOfTwo < pointsCount)
-		pointsCountPowerOfTwo *= 2;
-
-	int iterationNumber = 0;
-
+	while (pointsCountPowerOfTwo < pointsCount) pointsCountPowerOfTwo *= 2;
 	int reduceBlocksCount = (int)ceil((float)pointsCountPowerOfTwo / THREADS_PER_BLOCK);
+	int iterationNumber = 0;
 
 	printf("Preparing memory...\n");
 
@@ -611,7 +559,7 @@ cudaError_t kMeansFastReduce(float* points, int clustersCount, int pointsCount, 
 
 		for (size_t k = 0; k < clustersCount; k++)
 		{
-			reduceMembers << <reduceBlocksCount, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(int) >> > (
+			pickMembership << <reduceBlocksCount, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(int) >> > (
 				dev_membership,
 				dev_membership_sums,
 				dev_membership_result,
@@ -632,45 +580,14 @@ cudaError_t kMeansFastReduce(float* points, int clustersCount, int pointsCount, 
 				fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countMembers!\n", cudaStatus);
 				goto Error;
 			}
-
-			int currentReduceBlocks = reduceBlocksCount / THREADS_PER_BLOCK;
-			while (currentReduceBlocks > 1) {
-				reduceGlobal<THREADS_PER_BLOCK / 2> << <currentReduceBlocks, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(int) >> > (
-					dev_membership_sums,
-					dev_membership_sums,
-					currentReduceBlocks
-					);
-
-				cudaStatus = cudaGetLastError();
-				if (cudaStatus != cudaSuccess) {
-					fprintf(stderr, "countMembers launch failed: %s\n", cudaGetErrorString(cudaStatus));
-					goto Error;
-				}
-
-				cudaStatus = cudaDeviceSynchronize();
-				if (cudaStatus != cudaSuccess) {
-					fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countMembers!\n", cudaStatus);
-					goto Error;
-				}
-
-				currentReduceBlocks /= THREADS_PER_BLOCK;
-			}
-
-			updateMembers << <1, reduceBlocksCount >> > (dev_membership_sums, dev_membership_result);
-
-			cudaStatus = cudaGetLastError();
+			
+			cudaStatus = reduce(dev_membership_sums, pointsCountPowerOfTwo);
 			if (cudaStatus != cudaSuccess) {
-				fprintf(stderr, "countMembers launch failed: %s\n", cudaGetErrorString(cudaStatus));
+				fprintf(stderr, "reduce launch failed: %s\n", cudaGetErrorString(cudaStatus));
 				goto Error;
 			}
 
-			cudaStatus = cudaDeviceSynchronize();
-			if (cudaStatus != cudaSuccess) {
-				fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countMembers!\n", cudaStatus);
-				goto Error;
-			}
-
-			cudaStatus = cudaMemcpy(&membersCount, dev_membership_result, sizeof(int), cudaMemcpyDeviceToHost);
+			cudaStatus = cudaMemcpy(&membersCount, dev_membership_sums, sizeof(int), cudaMemcpyDeviceToHost);
 			if (cudaStatus != cudaSuccess) {
 				fprintf(stderr, "cudaMemcpy failed!");
 				goto Error;
@@ -683,7 +600,7 @@ cudaError_t kMeansFastReduce(float* points, int clustersCount, int pointsCount, 
 			{
 				for (size_t i = 0; i < dimNum; i++)
 				{
-					reduceCoordinates << <reduceBlocksCount, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(float) >> > (
+					pickCoordinate << <reduceBlocksCount, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(float) >> > (
 						dev_points,
 						dev_clusters,
 						dev_membership,
@@ -703,29 +620,21 @@ cudaError_t kMeansFastReduce(float* points, int clustersCount, int pointsCount, 
 						fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countCoordinate!\n", cudaStatus);
 						goto Error;
 					}
-				}
 
-				updateCoordinates << <1, reduceBlocksCount >> > (dev_clusters, dev_new_cluster, clustersCount, dimNum, k);
-				cudaStatus = cudaGetLastError();
-				if (cudaStatus != cudaSuccess) {
-					fprintf(stderr, "countCoordinate launch failed: %s\n", cudaGetErrorString(cudaStatus));
-					goto Error;
-				}
+					cudaStatus = reduce(dev_sums, pointsCountPowerOfTwo);
+					if (cudaStatus != cudaSuccess) {
+						fprintf(stderr, "reduce launch failed: %s\n", cudaGetErrorString(cudaStatus));
+						goto Error;
+					}
 
-				cudaStatus = cudaGetLastError();
-				if (cudaStatus != cudaSuccess) {
-					fprintf(stderr, "countCoordinate launch failed: %s\n", cudaGetErrorString(cudaStatus));
-					goto Error;
-				}
-
-				cudaStatus = cudaDeviceSynchronize();
-				if (cudaStatus != cudaSuccess) {
-					fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countCoordinate!\n", cudaStatus);
-					goto Error;
+					cudaStatus = cudaMemcpy(&(dev_clusters[i * clustersCount + k]), dev_sums, sizeof(float), cudaMemcpyDeviceToDevice);
+					if (cudaStatus != cudaSuccess) {
+						fprintf(stderr, "cudaMemcpy failed!");
+						goto Error;
+					}
 				}
 			}
 		}
-
 	} while (1);
 	float time;
 	cudaEventRecord(stop, 0);
@@ -758,6 +667,60 @@ Error:
 	cudaFree(dev_membershipChanged);
 
 	return cudaStatus;
+}
+
+template <class T>
+cudaError_t reduce(T* data, int n) {
+
+	int currentThreads = n;
+	cudaError_t cudaStatus;
+
+	while (currentThreads > 1) {
+		//printf("currentThreads: %d\n", currentThreads);
+		int dimGrid = (int)ceil((float)currentThreads / THREADS_PER_BLOCK);
+		int dimBlock = dimGrid == 1 ? currentThreads : THREADS_PER_BLOCK;
+		int	smemSize = dimBlock * sizeof(T);
+
+		switch (currentThreads / 2)
+		{
+		default:
+			reduceGlobal<512> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		case 256:
+			reduceGlobal<256> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		case 128:
+			reduceGlobal<128> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		case 64:
+			reduceGlobal< 64> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		case 32:
+			reduceGlobal< 32> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		case 16:
+			reduceGlobal< 16> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		case 8:
+			reduceGlobal< 8> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		case 4:
+			reduceGlobal< 4> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		case 2:
+			reduceGlobal< 2> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		case 1:
+			reduceGlobal< 1> << < dimGrid, dimBlock, smemSize >> > (data, data, currentThreads); break;
+		}
+
+		cudaStatus = cudaGetLastError();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "reduceGlobal launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			return cudaStatus;
+		}
+
+		cudaStatus = cudaDeviceSynchronize();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching reduceGlobal!\n", cudaStatus);
+			return cudaStatus;
+		}
+
+		currentThreads /= THREADS_PER_BLOCK;
+	}
+
+	return cudaSuccess;
 }
 
 void coalesceData(float** points, int pointsCount, int dimNum) {
