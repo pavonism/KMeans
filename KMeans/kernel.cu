@@ -112,7 +112,9 @@ __device__ void warpReduce(volatile T* sdata, unsigned int tid) {
 }
 
 template <unsigned int blockSize, class T>
-__device__ void reduce(volatile T* sdata, T* g_idata, T* g_odata, unsigned int n) {
+__global__ void reduceGlobal(T* g_idata, T* g_odata, unsigned int n) {
+	extern __shared__ __align__(sizeof(T)) unsigned char memory[];
+	T* sdata = reinterpret_cast<T*>(memory);
 	unsigned int tid = threadIdx.x;
 	unsigned int i = blockIdx.x * (blockSize * 2) + tid;
 	unsigned int gridSize = blockSize * 2 * gridDim.x;
@@ -126,14 +128,7 @@ __device__ void reduce(volatile T* sdata, T* g_idata, T* g_odata, unsigned int n
 	if (tid == 0) g_odata[blockIdx.x] = sdata[0];
 }
 
-template <unsigned int blockSize, class T>
-__global__ void reduceGlobal(T* g_idata, T* g_odata, unsigned int n) {
-	extern __shared__ unsigned char memory[];
-	T* sharedData = reinterpret_cast<T*>(memory);
-	reduce<blockSize>(sharedData, g_idata, g_odata, n);
-}
-
-__global__ void pickCoordinate(float* points, float* clusters, int* membership, float* sums, float* newCluster, int membersCount, int pointsCount, int pointsCountPowerOfTwo, int clustersCount, int dimNum, int dimension, int cluster) {
+__global__ void pickCoordinate(float* points, float* clusters, int* membership, float* sums, int membersCount, int pointsCount, int pointsCountPowerOfTwo, int clustersCount, int dimNum, int dimension, int cluster) {
 
 	extern __shared__ float pointData[];
 	int threadId = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x;
@@ -439,11 +434,10 @@ cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int 
 	float* dev_points = NULL;
 	float* dev_sums = NULL;
 	float* dev_clusters = NULL;
-	float* dev_new_cluster = NULL;
 	int* dev_membership = NULL;
 	int* dev_membership_sums = NULL;
-	int* dev_membership_result = NULL;
 	int* dev_membershipChanged = NULL;
+	int* dev_membership_result = NULL;
 	int membersCount = 0;
 	float delta = FLT_MAX;
 	cudaError_t cudaStatus;
@@ -475,12 +469,6 @@ cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int 
 	}
 
 	cudaStatus = cudaMalloc((void**)&dev_clusters, clustersCount * dimNum * sizeof(float));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed!");
-		goto Error;
-	}
-
-	cudaStatus = cudaMalloc((void**)&dev_new_cluster, reduceBlocksCount * dimNum * sizeof(float));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
@@ -605,7 +593,6 @@ cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int 
 						dev_clusters,
 						dev_membership,
 						dev_sums,
-						dev_new_cluster,
 						membersCount,
 						pointsCount,
 						pointsCountPowerOfTwo,
