@@ -44,6 +44,8 @@ void generateRandomPoints(char* path, int pointsCount, int dimNum);
 void generateRandomPointsNormal(char* path, int pointsCount, int dimNum, int groups);
 template <class T>
 cudaError_t reduce(T* data, int n);
+template <class T>
+cudaError_t reduceChunks(T* values, int n, cudaStream_t* streams, int k);
 
 __global__ void pointsDistance(float* points, float* clusters, int* membership, int* membershipDims, int* membershipChanged, int clustersCount, int pointsCount, int dimNum)
 {
@@ -128,7 +130,7 @@ __global__ void reduceGlobal(T* g_idata, T* g_odata, unsigned int n) {
 	if (tid == 0) g_odata[blockIdx.x] = sdata[0];
 }
 
-__global__ void pickCoordinate(float* points, float* clusters, int* membership, float* sums, int membersCount, int pointsCount, int pointsCountPowerOfTwo, int clustersCount, int dimNum, int dimension, int cluster) {
+__global__ void pickCoordinate(float* points, float* clusters, int* membership, float* sums, int* membersCount, int pointsCount, int pointsCountPowerOfTwo, int clustersCount, int dimNum) {
 
 	extern __shared__ float pointData[];
 	int threadId = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x;
@@ -142,15 +144,21 @@ __global__ void pickCoordinate(float* points, float* clusters, int* membership, 
 		member = membership[threadId];
 	}
 
-	if (threadId < pointsCount) {
-		value = points[dimension * pointsCount + threadId];
-	}
-	value = member == cluster ? value / membersCount : 0;
+	for (size_t dimension = 0; dimension < dimNum; dimension++)
+	{
+		if (threadId < pointsCount) {
+			value = points[dimension * pointsCount + threadId];
+		}
 
-	sums[threadId] = value;
+		for (size_t cluster = 0; cluster < clustersCount; cluster++)
+		{
+			float currentValue = member == cluster ? value / membersCount[cluster] : 0;
+			sums[((long long)cluster * dimNum + dimension) * pointsCount + threadId] = currentValue;
+		}
+	}
 }
 
-__global__ void pickMembership(int* membership, int* sums, int* result, int pointsCount, int pointsCountPowerOfTwo, int clustersCount, int cluster) {
+__global__ void pickMembership(int* membership, int* sums, int pointsCount, int pointsCountPowerOfTwo, int clustersCount) {
 
 	extern __shared__ int data[];
 
@@ -159,9 +167,21 @@ __global__ void pickMembership(int* membership, int* sums, int* result, int poin
 	if (threadId > pointsCountPowerOfTwo)
 		return;
 
-	int member = threadId < pointsCount ? membership[threadId] : -1;
-	member = member == cluster ? 1 : 0;
-	sums[threadId] = member;
+	for (size_t k = 0; k < clustersCount; k++)
+	{
+		int member = threadId < pointsCount ? membership[threadId] : -1;
+		member = member == k ? 1 : 0;
+		sums[k * pointsCountPowerOfTwo + threadId] = member;
+	}
+}
+
+template <class T>
+__global__ void gather(T* data, int chunkSizes, int chunks) {
+
+	if (threadIdx.x > chunks)
+		return;
+
+	data[threadIdx.x] = data[(long long)threadIdx.x * chunkSizes];;
 }
 
 int main(int argc, char** argv)
@@ -438,9 +458,15 @@ cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int 
 	int* dev_membership_sums = NULL;
 	int* dev_membershipChanged = NULL;
 	int* dev_membership_result = NULL;
-	int membersCount = 0;
+	cudaStream_t* streams = new cudaStream_t[clustersCount * dimNum];
+	int* membersCount = new int[clustersCount];
 	float delta = FLT_MAX;
 	cudaError_t cudaStatus;
+
+	for (size_t k = 0; k < clustersCount * dimNum; k++)
+	{
+		cudaStreamCreate(&streams[k]);
+	}
 
 	int blocksCount = (int)ceil((float)pointsCount / THREADS_PER_BLOCK);
 	int pointsCountPowerOfTwo = 1;
@@ -462,7 +488,7 @@ cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int 
 		goto Error;
 	}
 
-	cudaStatus = cudaMalloc((void**)&dev_sums, pointsCountPowerOfTwo * sizeof(float));
+	cudaStatus = cudaMalloc((void**)&dev_sums, clustersCount * dimNum * pointsCountPowerOfTwo * sizeof(float));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
@@ -486,7 +512,7 @@ cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int 
 		goto Error;
 	}
 
-	cudaStatus = cudaMalloc((void**)&dev_membership_sums, pointsCountPowerOfTwo * sizeof(int));
+	cudaStatus = cudaMalloc((void**)&dev_membership_sums, clustersCount * pointsCountPowerOfTwo * sizeof(int));
 	if (cudaStatus != cudaSuccess) {
 		fprintf(stderr, "cudaMalloc failed!");
 		goto Error;
@@ -522,7 +548,8 @@ cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int 
 	printf("Calculating on GPU...\n");
 	cudaEventRecord(start, 0);
 
-	do {
+	do
+	{
 		printf(".");
 		pointsDistance << <blocksCount, THREADS_PER_BLOCK >> > (dev_points, dev_clusters, dev_membership, NULL, dev_membershipChanged, clustersCount, pointsCount, dimNum);
 
@@ -545,83 +572,65 @@ cudaError_t kMeansReduce(float* points, int clustersCount, int pointsCount, int 
 			break;
 		//printf("Delta: %f", delta);
 
-		for (size_t k = 0; k < clustersCount; k++)
-		{
-			pickMembership << <reduceBlocksCount, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(int) >> > (
-				dev_membership,
-				dev_membership_sums,
-				dev_membership_result,
-				pointsCount,
-				pointsCountPowerOfTwo,
-				clustersCount,
-				k
-				);
+		pickMembership << <reduceBlocksCount, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(int) >> > (
+			dev_membership,
+			dev_membership_sums,
+			pointsCount,
+			pointsCountPowerOfTwo,
+			clustersCount
+			);
 
-			cudaStatus = cudaGetLastError();
-			if (cudaStatus != cudaSuccess) {
-				fprintf(stderr, "countMembers launch failed: %s\n", cudaGetErrorString(cudaStatus));
-				goto Error;
-			}
-
-			cudaStatus = cudaDeviceSynchronize();
-			if (cudaStatus != cudaSuccess) {
-				fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countMembers!\n", cudaStatus);
-				goto Error;
-			}
-			
-			cudaStatus = reduce(dev_membership_sums, pointsCountPowerOfTwo);
-			if (cudaStatus != cudaSuccess) {
-				fprintf(stderr, "reduce launch failed: %s\n", cudaGetErrorString(cudaStatus));
-				goto Error;
-			}
-
-			cudaStatus = cudaMemcpy(&membersCount, dev_membership_sums, sizeof(int), cudaMemcpyDeviceToHost);
-			if (cudaStatus != cudaSuccess) {
-				fprintf(stderr, "cudaMemcpy failed!");
-				goto Error;
-			}
-
-			//printf("Reduce BlocksCount: %d\n", reduceBlocksCount);
-			//printf("reducing threads: %d\n", pointsCountPowerOfTwo);
-			//printf("Members count: %d\n", membersCount);
-			if (membersCount > 0)
-			{
-				for (size_t i = 0; i < dimNum; i++)
-				{
-					pickCoordinate << <reduceBlocksCount, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(float) >> > (
-						dev_points,
-						dev_clusters,
-						dev_membership,
-						dev_sums,
-						membersCount,
-						pointsCount,
-						pointsCountPowerOfTwo,
-						clustersCount,
-						dimNum,
-						i,
-						k
-						);
-
-					cudaStatus = cudaDeviceSynchronize();
-					if (cudaStatus != cudaSuccess) {
-						fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countCoordinate!\n", cudaStatus);
-						goto Error;
-					}
-
-					cudaStatus = reduce(dev_sums, pointsCountPowerOfTwo);
-					if (cudaStatus != cudaSuccess) {
-						fprintf(stderr, "reduce launch failed: %s\n", cudaGetErrorString(cudaStatus));
-						goto Error;
-					}
-
-					cudaStatus = cudaMemcpy(&(dev_clusters[i * clustersCount + k]), dev_sums, sizeof(float), cudaMemcpyDeviceToDevice);
-					if (cudaStatus != cudaSuccess) {
-						fprintf(stderr, "cudaMemcpy failed!");
-						goto Error;
-					}
-				}
-			}
+		cudaStatus = cudaGetLastError();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "countMembers launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			goto Error;
 		}
+
+		cudaStatus = cudaDeviceSynchronize();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countMembers!\n", cudaStatus);
+			goto Error;
+		}
+
+		cudaStatus = reduceChunks(dev_membership_sums, pointsCountPowerOfTwo, streams, clustersCount);
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "reduce launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			goto Error;
+		}
+
+
+		pickCoordinate << <reduceBlocksCount, THREADS_PER_BLOCK, THREADS_PER_BLOCK * sizeof(float) >> > (
+			dev_points,
+			dev_clusters,
+			dev_membership,
+			dev_sums,
+			dev_membership_sums,
+			pointsCount,
+			pointsCountPowerOfTwo,
+			clustersCount,
+			dimNum
+			);
+
+		cudaStatus = cudaGetLastError();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "countMembers launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			goto Error;
+		}
+
+		cudaStatus = cudaDeviceSynchronize();
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countMembers!\n", cudaStatus);
+			goto Error;
+		}
+
+		cudaStatus = reduceChunks(dev_sums, pointsCountPowerOfTwo, streams, clustersCount * dimNum);
+		if (cudaStatus != cudaSuccess) {
+			fprintf(stderr, "reduce launch failed: %s\n", cudaGetErrorString(cudaStatus));
+			goto Error;
+		}
+
+		cudaMemcpy(dev_clusters, dev_sums, clustersCount * dimNum * sizeof(float), cudaMemcpyDeviceToDevice);
+
 	} while (1);
 	float time;
 	cudaEventRecord(stop, 0);
@@ -652,6 +661,13 @@ Error:
 	cudaFree(dev_membership_result);
 	cudaFree(dev_clusters);
 	cudaFree(dev_membershipChanged);
+
+	for (size_t k = 0; k < clustersCount; k++)
+	{
+		cudaStreamDestroy(streams[k]);
+	}
+	delete streams;
+	delete membersCount;
 
 	return cudaStatus;
 }
@@ -705,6 +721,80 @@ cudaError_t reduce(T* data, int n) {
 		}
 
 		currentThreads /= THREADS_PER_BLOCK;
+	}
+
+	return cudaSuccess;
+}
+
+template <class T>
+cudaError_t reduceChunks(T* values, int n, cudaStream_t* streams, int k) {
+
+	int currentThreads = n;
+	cudaError_t cudaStatus;
+
+	while (currentThreads > 1) {
+		//printf("currentThreads: %d\n", currentThreads);
+		int dimGrid = (int)ceil((float)currentThreads / THREADS_PER_BLOCK);
+		int dimBlock = dimGrid == 1 ? currentThreads : THREADS_PER_BLOCK;
+		int	smemSize = dimBlock * sizeof(T);
+
+		for (size_t i = 0; i < k; i++)
+		{
+			T* data = values + i * n;
+
+			switch (currentThreads / 2)
+			{
+			default:
+				reduceGlobal<512> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			case 256:
+				reduceGlobal<256> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			case 128:
+				reduceGlobal<128> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			case 64:
+				reduceGlobal< 64> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			case 32:
+				reduceGlobal< 32> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			case 16:
+				reduceGlobal< 16> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			case 8:
+				reduceGlobal< 8> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			case 4:
+				reduceGlobal< 4> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			case 2:
+				reduceGlobal< 2> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			case 1:
+				reduceGlobal< 1> << < dimGrid, dimBlock, smemSize, streams[i] >> > (data, data, currentThreads); break;
+			}
+
+			cudaStatus = cudaGetLastError();
+			if (cudaStatus != cudaSuccess) {
+				fprintf(stderr, "reduceGlobal launch failed: %s\n", cudaGetErrorString(cudaStatus));
+				return cudaStatus;
+			}
+		}
+
+		currentThreads /= THREADS_PER_BLOCK;
+	}
+
+	cudaStatus = cudaDeviceSynchronize();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countMembers!\n", cudaStatus);
+		return cudaStatus;
+	}
+
+	int blocks = (int)ceil((float)k / THREADS_PER_BLOCK);
+	gather << <blocks, THREADS_PER_BLOCK >> > (values, n, k);
+
+	cudaStatus = cudaGetLastError();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "reduceGlobal launch failed: %s\n", cudaGetErrorString(cudaStatus));
+		return cudaStatus;
+	}
+
+	cudaStatus = cudaDeviceSynchronize();
+	if (cudaStatus != cudaSuccess) {
+		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching countMembers!\n", cudaStatus);
+		return cudaStatus;
 	}
 
 	return cudaSuccess;
