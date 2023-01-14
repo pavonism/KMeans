@@ -391,10 +391,11 @@ void kMeansCpu(kMeansArgs_t* args)
 				}
 			}
 
-			for (size_t n = 0; n < dimNum; n++)
-			{
-				args->outClusters[n * clustersCount + k] = newCluster[n] / members;
-			}
+			if(members > 0)
+				for (size_t n = 0; n < dimNum; n++)
+				{
+					args->outClusters[n * clustersCount + k] = newCluster[n] / members;
+				}
 		}
 
 	} while (1);
